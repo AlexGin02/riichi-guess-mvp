@@ -144,27 +144,5 @@ export async function saveGameState(supabase: SupabaseClient, roomId: string, st
     throw error;
   }
 
-  const playerResults = await Promise.all(
-    (["east", "south"] as const).map((seat) => {
-      const player = state.players[seat];
-      if (!player) {
-        return Promise.resolve({ error: null });
-      }
-      return supabase.from("players").upsert({
-        room_id: roomId,
-        id: player.id,
-        seat,
-        hand_json: player.hand,
-        river_json: player.river,
-        is_connected: player.isConnected
-      });
-    })
-  );
-
-  const playerError = playerResults.find((result) => result.error)?.error;
-  if (playerError) {
-    throw playerError;
-  }
-
   return data as RoomRow;
 }

@@ -6,9 +6,10 @@ import {
   CallType,
   GameState,
   forceKnownTenpaiSetup,
-  resetGameKeepingPlayers,
+  getPreviouslyGuessedTiles,
   resolveGuess,
   resolveSelfDrawTrial,
+  startNextHandWithRotatedSeats,
   skipCall,
   takeCall,
   takeDiscard
@@ -99,6 +100,14 @@ export default function Home() {
       void supabase.removeChannel(channel);
     };
   }, [room?.id, supabase]);
+
+  useEffect(() => {
+    if (!state) {
+      return;
+    }
+    const guessedTiles = getPreviouslyGuessedTiles(state);
+    setSelectedGuess((current) => current.filter((tile) => !guessedTiles.has(tile)));
+  }, [state?.guessHistory]);
 
   async function runAction(action: () => Promise<void>) {
     setMessage("");
@@ -215,7 +224,7 @@ export default function Home() {
             </section>
           )}
 
-          <section className="grid gap-4 lg:grid-cols-[1fr_340px]">
+          <section className="grid gap-4 lg:grid-cols-[1fr_500px]">
             <div className="grid gap-4">
               <div className="grid gap-4 xl:grid-cols-2">
                 <River title="东家牌河" seat="east" tiles={state.players.east?.river ?? []} current={state.currentTurn === "east"} />
@@ -255,7 +264,7 @@ export default function Home() {
                     if (!state.eastPlayerId) {
                       return;
                     }
-                    await writeState(resetGameKeepingPlayers(state));
+                    await writeState(startNextHandWithRotatedSeats(state));
                   })
                 }
                 onForceTenpai={() =>
@@ -310,11 +319,27 @@ export default function Home() {
                           if (!seat || state.currentTurn !== seat || state.pendingCall) {
                             throw new Error("还没轮到你。");
                           }
-                          await writeState(takeDiscard(state, seat, tile));
+                          await writeState(takeDiscard(state, seat, tile, "hand"));
                         })
                       }
                     />
                   ))}
+                  {player.drawnTile && (
+                    <div className="ml-8 flex items-center">
+                      <TileButton
+                        tile={player.drawnTile}
+                        disabled={!isMyTurn || pendingCallForMe || isBusy}
+                        onClick={() =>
+                          void runAction(async () => {
+                            if (!seat || state.currentTurn !== seat || state.pendingCall || !player.drawnTile) {
+                              throw new Error("还没轮到你。");
+                            }
+                            await writeState(takeDiscard(state, seat, player.drawnTile, "drawn"));
+                          })
+                        }
+                      />
+                    </div>
+                  )}
                 </div>
                 {isMyTurn && <div className="mt-1 rounded-md bg-jade px-3 py-2 text-sm font-black text-ink">请选择一张牌打出。</div>}
               </div>
@@ -360,12 +385,8 @@ function River({ title, seat, tiles, current }: { title: string; seat: "east" | 
         <h2 className="text-lg font-black text-ink">{title}</h2>
         <span className={`rounded-md px-2 py-1 text-xs font-black uppercase ${current ? "bg-ember text-white" : "bg-white text-stone-600"}`}>{seat === "east" ? "东" : "南"}</span>
       </div>
-      <div className="flex min-h-24 flex-wrap content-start gap-2 rounded-md border border-stone-300 bg-[#1f6b5a] p-3">
-        {tiles.length === 0 ? (
-          <span className="text-sm font-bold text-white/75">暂无弃牌</span>
-        ) : (
-          tiles.map((tile, index) => <TileButton key={`${tile}-${index}`} tile={tile} disabled />)
-        )}
+      <div className="grid min-h-24 grid-cols-6 content-start gap-3 rounded-md border border-stone-300 bg-[#1f6b5a] p-3">
+        {tiles.map((tile, index) => <TileButton key={`${tile}-${index}`} tile={tile} size="river" disabled />)}
       </div>
     </section>
   );
@@ -396,40 +417,46 @@ function PhasePanel({
   onCall: (type: CallType) => void;
   onSkipCall: () => void;
 }) {
+  const previouslyGuessedTiles = getPreviouslyGuessedTiles(state);
+  const selectedContainsPreviousGuess = selectedGuess.some((tile) => previouslyGuessedTiles.has(tile));
+
   if (state.pendingCall) {
     const canRespond = seat === state.pendingCall.responderSeat;
     return (
       <section className="rounded-md border border-ember bg-white p-4 shadow-sm">
         <div className="rounded-md bg-ember px-3 py-2 text-white">
-          <h2 className="font-black">鸣牌选择</h2>
+          <h2 className="font-black">正在思考...</h2>
           <p className="text-sm font-semibold text-white/90">
-            {canRespond ? "你可以对这张弃牌进行操作。" : "等待对手选择吃/碰/杠或跳过。"}
+            {canRespond ? "你可以对这张弃牌进行操作。" : "等待对手进行操作。"}
           </p>
         </div>
         <div className="mt-3 flex items-center gap-3 rounded-md bg-paper p-3">
           <span className="text-sm font-black text-stone-700">对方打出</span>
           <TileButton tile={state.pendingCall.tile} disabled />
         </div>
-        <div className="mt-4 grid grid-cols-2 gap-2">
-          {state.pendingCall.options.includes("chi") && (
-            <button type="button" disabled={!canRespond || isBusy} onClick={() => onCall("chi")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
-              吃
+        {canRespond && (
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            {state.pendingCall.options.includes("chi") && (
+              <button type="button" disabled={isBusy} onClick={() => onCall("chi")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
+                吃
+              </button>
+            )}
+            {state.pendingCall.options.includes("pon") && (
+              <button type="button" disabled={isBusy} onClick={() => onCall("pon")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
+                碰
+              </button>
+            )}
+            {state.pendingCall.options.includes("kan") && (
+              <button type="button" disabled={isBusy} onClick={() => onCall("kan")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
+                杠
+              </button>
+            )}
+            <button type="button" disabled={isBusy} onClick={onSkipCall} className="rounded-md bg-stone-700 px-4 py-3 font-black text-white disabled:opacity-50">
+              跳过
             </button>
-          )}
-          {state.pendingCall.options.includes("pon") && (
-            <button type="button" disabled={!canRespond || isBusy} onClick={() => onCall("pon")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
-              碰
-            </button>
-          )}
-          {state.pendingCall.options.includes("kan") && (
-            <button type="button" disabled={!canRespond || isBusy} onClick={() => onCall("kan")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
-              杠
-            </button>
-          )}
-          <button type="button" disabled={!canRespond || isBusy} onClick={onSkipCall} className="rounded-md bg-stone-700 px-4 py-3 font-black text-white disabled:opacity-50">
-            跳过
-          </button>
-        </div>
+          </div>
+        )}
+        <PublicInfoHistory state={state} />
       </section>
     );
   }
@@ -442,27 +469,37 @@ function PhasePanel({
           <h2 className="font-black">猜听牌</h2>
           <p className="text-sm font-semibold text-white/90">{canGuess ? "你的回合：请选择两个可能的听牌。" : "等待对手猜听牌。"}</p>
         </div>
-        <div className="mt-4 grid grid-cols-5 gap-2">
-          {TILE_TYPES.map((tile) => (
-            <TileButton
-              key={tile}
-              tile={tile}
-              selected={selectedGuess.includes(tile)}
-              disabled={!canGuess || isBusy}
-              onClick={() => {
-                if (selectedGuess.includes(tile)) {
-                  setSelectedGuess(selectedGuess.filter((selected) => selected !== tile));
-                } else if (selectedGuess.length < 2) {
-                  setSelectedGuess([...selectedGuess, tile]);
-                }
-              }}
-            />
-          ))}
+        <div className="mt-4 grid grid-cols-5 gap-2 sm:grid-cols-6 xl:grid-cols-9">
+          {TILE_TYPES.map((tile) => {
+            const wasGuessed = previouslyGuessedTiles.has(tile);
+            return (
+              <div key={tile}>
+                <TileButton
+                  tile={tile}
+                  size="sm"
+                  disabledTone={wasGuessed ? "guessed" : "default"}
+                  selected={selectedGuess.includes(tile)}
+                  disabled={!canGuess || isBusy || wasGuessed}
+                  onClick={() => {
+                    if (wasGuessed) {
+                      return;
+                    }
+                    if (selectedGuess.includes(tile)) {
+                      setSelectedGuess(selectedGuess.filter((selected) => selected !== tile));
+                    } else if (selectedGuess.length < 2) {
+                      setSelectedGuess([...selectedGuess, tile]);
+                    }
+                  }}
+                />
+              </div>
+            );
+          })}
         </div>
         <div className="mt-3 text-sm font-bold text-stone-600">已选择：{selectedGuess.length}/2</div>
-        <button type="button" disabled={!canGuess || selectedGuess.length !== 2 || isBusy} onClick={onGuess} className="mt-3 w-full rounded-md bg-ember px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
+        <button type="button" disabled={!canGuess || selectedGuess.length !== 2 || selectedContainsPreviousGuess || isBusy} onClick={onGuess} className="mt-3 w-full rounded-md bg-ember px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
           确认猜牌
         </button>
+        <PublicInfoHistory state={state} />
       </section>
     );
   }
@@ -479,6 +516,7 @@ function PhasePanel({
         <button type="button" disabled={!canRun || isBusy} onClick={onSelfDraw} className="mt-4 w-full rounded-md bg-felt px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
           开始试抽
         </button>
+        <PublicInfoHistory state={state} />
       </section>
     );
   }
@@ -490,15 +528,16 @@ function PhasePanel({
           <h2 className="font-black">游戏结束</h2>
           <p className="text-sm font-semibold text-white/90">{gameOverText(state)}</p>
         </div>
+        <TenpaiShapeReveal state={state} />
         {state.lockedWaits.length > 0 && (
           <div className="mt-3">
             <div className="text-sm font-black text-stone-600">原始听牌</div>
             <div className="mt-2 flex flex-wrap gap-2">{state.lockedWaits.map((tile) => <TileButton key={tile} tile={tile} disabled />)}</div>
           </div>
         )}
-        <SelfDrawHistory state={state} />
+        <PublicInfoHistory state={state} />
         <button type="button" disabled={isBusy || !seat} onClick={onReset} className="mt-4 w-full rounded-md bg-ink px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
-          重开本房间
+          下一局
         </button>
       </section>
     );
@@ -513,7 +552,7 @@ function PhasePanel({
       {state.phase === "draw_discard" && seat === state.currentTurn && !state.pendingCall && (
         <DevTestControls disabled={isBusy} onForceTenpai={onForceTenpai} />
       )}
-      <SelfDrawHistory state={state} />
+      <PublicInfoHistory state={state} />
     </section>
   );
 }
@@ -582,34 +621,96 @@ function DevTestControls({ disabled, onForceTenpai }: { disabled: boolean; onFor
   );
 }
 
-function SelfDrawHistory({ state }: { state: GameState }) {
-  const attempts = state.selfDrawAttempts.slice(-3).reverse();
-  if (attempts.length === 0) {
+function TenpaiShapeReveal({ state }: { state: GameState }) {
+  if (!state.tenpaiSeat) {
+    return null;
+  }
+
+  const tenpaiPlayer = state.players[state.tenpaiSeat];
+  if (!tenpaiPlayer) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-stone-200 bg-paper p-3">
+      <div className="text-sm font-black text-stone-700">听牌人牌型 · {state.tenpaiSeat === "east" ? "东家" : "南家"}</div>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {tenpaiPlayer.hand.map((tile, index) => (
+          <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled />
+        ))}
+      </div>
+      {(tenpaiPlayer.melds ?? []).length > 0 && (
+        <div className="mt-3 space-y-2">
+          <div className="text-xs font-black text-stone-600">副露</div>
+          {(tenpaiPlayer.melds ?? []).map((meld, meldIndex) => (
+            <div key={`${meld.type}-${meldIndex}`} className="flex flex-wrap items-center gap-1.5">
+              <span className="mr-1 text-xs font-black text-stone-600">{callLabel(meld.type)}</span>
+              {meld.tiles.map((tile, tileIndex) => (
+                <TileButton key={`${tile}-${tileIndex}`} tile={tile} size="info" disabled />
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PublicInfoHistory({ state }: { state: GameState }) {
+  const guessHistory = state.guessHistory ?? [];
+  const selfDrawAttempts = state.selfDrawAttempts ?? [];
+  if (guessHistory.length === 0 && selfDrawAttempts.length === 0) {
     return null;
   }
 
   return (
     <div className="mt-4 space-y-3">
-      {attempts.map((attempt, attemptIndex) => {
-        const hitIndex = attempt.hitTile ? attempt.draws.findIndex((tile) => tile === attempt.hitTile) : -1;
+      <div className="text-sm font-black text-stone-700">公开信息</div>
+      {guessHistory.map((guess, roundIndex) => {
+        const attempt = selfDrawAttempts[roundIndex];
+        const hitIndex = attempt?.hitTile ? attempt.draws.findIndex((tile) => tile === attempt.hitTile) : -1;
         return (
-          <div key={`${attempt.draws.join("-")}-${attemptIndex}`} className="rounded-md border border-stone-200 bg-paper p-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="text-sm font-black text-stone-700">{attemptIndex === 0 ? "最近自摸挑战" : "上一轮自摸挑战"}</div>
-              <div className={`rounded-md px-2 py-1 text-xs font-black ${attempt.won ? "bg-felt text-white" : "bg-stone-200 text-stone-700"}`}>
-                {attempt.won && hitIndex >= 0 ? `第 ${hitIndex + 1} 张自摸成功` : "5 张均未自摸，返回猜听牌阶段"}
+          <div key={`round-${roundIndex}-${guess.guessedTiles.join("-")}`} className="rounded-md border border-stone-200 bg-paper p-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="w-20 shrink-0 text-sm font-black text-stone-700">第{roundIndex + 1}轮猜牌</div>
+              <div className="flex flex-wrap gap-1.5">
+                {guess.guessedTiles.map((tile, tileIndex) => (
+                  <TileButton key={`${tile}-${tileIndex}`} tile={tile} size="info" disabled />
+                ))}
               </div>
             </div>
-            <div className="mt-3 grid gap-2">
-              {attempt.draws.map((tile, index) => (
-                <div key={`${tile}-${index}`} className="flex items-center gap-3 rounded-md bg-white/70 p-2">
-                  <div className="w-14 shrink-0 text-sm font-black text-stone-700">第{index + 1}张</div>
-                  <TileButton tile={tile} disabled selected={attempt.hitTile === tile} />
-                  <div className={`text-sm font-black ${attempt.hitTile === tile ? "text-felt" : "text-stone-500"}`}>
-                    {attempt.hitTile === tile ? "自摸成功" : "未命中"}
-                  </div>
+            {attempt ? (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <div className="w-20 shrink-0 text-sm font-black text-stone-700">第{roundIndex + 1}轮自摸</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {attempt.draws.map((tile, index) => (
+                    <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} />
+                  ))}
                 </div>
-              ))}
+                <div className={`ml-auto rounded-md px-2 py-1 text-xs font-black ${attempt.won ? "bg-felt text-white" : "bg-stone-200 text-stone-700"}`}>
+                  {attempt.won && hitIndex >= 0 ? `结果：第 ${hitIndex + 1} 张自摸成功` : "结果：未命中"}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-2 text-sm font-bold text-stone-500">{guess.correct ? "猜中，游戏结束。" : "等待自摸挑战。"}</div>
+            )}
+          </div>
+        );
+      })}
+      {selfDrawAttempts.slice(guessHistory.length).map((attempt, extraIndex) => {
+        const hitIndex = attempt.hitTile ? attempt.draws.findIndex((tile) => tile === attempt.hitTile) : -1;
+        return (
+          <div key={`extra-${extraIndex}-${attempt.draws.join("-")}`} className="rounded-md border border-stone-200 bg-paper p-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="w-20 shrink-0 text-sm font-black text-stone-700">自摸挑战</div>
+              <div className="flex flex-wrap gap-1.5">
+                {attempt.draws.map((tile, index) => (
+                  <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} />
+                ))}
+              </div>
+              <div className={`ml-auto rounded-md px-2 py-1 text-xs font-black ${attempt.won ? "bg-felt text-white" : "bg-stone-200 text-stone-700"}`}>
+                {attempt.won && hitIndex >= 0 ? `结果：第 ${hitIndex + 1} 张自摸成功` : "结果：未命中"}
+              </div>
             </div>
           </div>
         );

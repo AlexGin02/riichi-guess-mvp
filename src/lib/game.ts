@@ -6,7 +6,6 @@ import {
   createWall,
   dealInitialHands,
   discardTile,
-  drawTile,
   getWinningTilesForTenpai,
   runSelfDrawTrial,
   shuffleWall,
@@ -17,6 +16,7 @@ export type PlayerState = {
   id: string;
   seat: Seat;
   hand: Tile[];
+  drawnTile?: Tile | null;
   river: Tile[];
   melds?: OpenMeld[];
   isConnected: boolean;
@@ -83,6 +83,7 @@ export function createInitialGame(roomCode: string, eastPlayerId: string, random
         id: eastPlayerId,
         seat: "east",
         hand: deal.eastHand,
+        drawnTile: null,
         river: [],
         melds: [],
         isConnected: true
@@ -118,6 +119,7 @@ export function joinGame(state: GameState, southPlayerId: string): GameState {
         id: southPlayerId,
         seat: "south",
         hand: state.pendingSouthHand,
+        drawnTile: null,
         river: [],
         melds: [],
         isConnected: true
@@ -133,6 +135,15 @@ export function resetGameKeepingPlayers(state: GameState, random = Math.random):
 
   const next = createInitialGame(state.roomCode, state.eastPlayerId, random);
   return state.southPlayerId ? joinGame(next, state.southPlayerId) : next;
+}
+
+export function startNextHandWithRotatedSeats(state: GameState, random = Math.random): GameState {
+  if (!state.eastPlayerId || !state.southPlayerId) {
+    throw new Error("Cannot start the next hand without two players.");
+  }
+
+  const next = createInitialGame(state.roomCode, state.southPlayerId, random);
+  return joinGame(next, state.eastPlayerId);
 }
 
 export function forceKnownTenpaiSetup(state: GameState, seat: Seat): GameState {
@@ -161,7 +172,7 @@ export function forceKnownTenpaiSetup(state: GameState, seat: Seat): GameState {
     wall: ["1m", "2m", "3m", "4m", "6m", "5m", ...state.wall],
     players: {
       ...state.players,
-      [seat]: { ...player, hand: sortHand(knownTenpaiHand) }
+      [seat]: { ...player, hand: sortHand(knownTenpaiHand), drawnTile: null }
     }
   };
 }
@@ -181,37 +192,40 @@ export function takeDraw(state: GameState, seat: Seat): GameState {
   assertPhase(state, "draw_discard");
   assertTurn(state, seat);
   const player = requirePlayer(state, seat);
+  if (player.drawnTile) {
+    return state;
+  }
 
   if (state.wall.length === 0) {
     return endExhaustiveDraw(state);
   }
 
-  const drawn = drawTile(player.hand, state.wall);
+  const [tile, ...remainingWall] = state.wall;
   return {
     ...state,
-    wall: drawn.wall,
+    wall: remainingWall,
     players: {
       ...state.players,
-      [seat]: { ...player, hand: drawn.hand }
+      [seat]: { ...player, drawnTile: tile }
     }
   };
 }
 
-export function takeDiscard(state: GameState, seat: Seat, tile: Tile): GameState {
+export function takeDiscard(state: GameState, seat: Seat, tile: Tile, source: "hand" | "drawn" = "hand"): GameState {
   assertPhase(state, "draw_discard");
   assertTurn(state, seat);
   if (state.pendingCall) {
     throw new Error("Call decision is pending.");
   }
   const player = requirePlayer(state, seat);
-  const discarded = discardTile(player.hand, player.river, tile);
+  const discarded = discardFromPlayer(player, tile, source);
   const nextSeat = seat === "east" ? "south" : "east";
   const nextState: GameState = {
     ...state,
     currentTurn: nextSeat,
     players: {
       ...state.players,
-      [seat]: { ...player, hand: discarded.hand, river: discarded.river }
+      [seat]: { ...player, hand: discarded.hand, drawnTile: discarded.drawnTile, river: discarded.river }
     }
   };
 
@@ -294,29 +308,35 @@ export function resolveGuess(state: GameState, guessedTiles: Tile[]): GameState 
   if (guessedTiles.length !== 2 || new Set(guessedTiles).size !== 2) {
     throw new Error("A guess must contain exactly two distinct tile types.");
   }
+  const previouslyGuessed = getPreviouslyGuessedTiles(state);
+  if (guessedTiles.some((tile) => previouslyGuessed.has(tile))) {
+    throw new Error("不能重复猜已经猜过的牌。");
+  }
 
   const correct = checkGuessAgainstWaits(guessedTiles, state.lockedWaits);
   const nextGuess = { guessedTiles, correct, waits: correct ? state.lockedWaits : undefined };
+  const guessHistory = state.guessHistory ?? [];
   if (correct) {
     return {
       ...state,
       phase: "game_over",
       winnerSeat: state.guesserSeat,
       winReason: "guesser_correct",
-      guessHistory: [...state.guessHistory, nextGuess]
+      guessHistory: [...guessHistory, nextGuess]
     };
   }
 
   return {
     ...state,
     phase: "self_draw_trial",
-    guessHistory: [...state.guessHistory, nextGuess]
+    guessHistory: [...guessHistory, nextGuess]
   };
 }
 
 export function resolveSelfDrawTrial(state: GameState, maxDraws = 5): GameState {
   assertPhase(state, "self_draw_trial");
   const result = runSelfDrawTrial(state.lockedWaits, state.wall, maxDraws);
+  const selfDrawAttempts = state.selfDrawAttempts ?? [];
   const selfDrawRecord = {
     draws: result.draws,
     hitTile: result.hitTile,
@@ -330,7 +350,7 @@ export function resolveSelfDrawTrial(state: GameState, maxDraws = 5): GameState 
       wall: result.remainingWall,
       winnerSeat: state.tenpaiSeat,
       winReason: "self_draw",
-      selfDrawAttempts: [...state.selfDrawAttempts, selfDrawRecord]
+      selfDrawAttempts: [...selfDrawAttempts, selfDrawRecord]
     };
   }
 
@@ -341,7 +361,7 @@ export function resolveSelfDrawTrial(state: GameState, maxDraws = 5): GameState 
       wall: result.remainingWall,
       winnerSeat: null,
       winReason: "exhaustive_draw",
-      selfDrawAttempts: [...state.selfDrawAttempts, selfDrawRecord]
+      selfDrawAttempts: [...selfDrawAttempts, selfDrawRecord]
     };
   }
 
@@ -349,8 +369,12 @@ export function resolveSelfDrawTrial(state: GameState, maxDraws = 5): GameState 
     ...state,
     phase: "guessing",
     wall: result.remainingWall,
-    selfDrawAttempts: [...state.selfDrawAttempts, selfDrawRecord]
+    selfDrawAttempts: [...selfDrawAttempts, selfDrawRecord]
   };
+}
+
+export function getPreviouslyGuessedTiles(state: Pick<GameState, "guessHistory">): Set<Tile> {
+  return new Set((state.guessHistory ?? []).flatMap((guess) => guess.guessedTiles));
 }
 
 export function publicStateForSeat(state: GameState, viewerSeat: Seat | null): GameState {
@@ -487,14 +511,38 @@ function drawForTurnStart(state: GameState, seat: Seat): GameState {
   }
 
   const player = requirePlayer(state, seat);
-  const drawn = drawTile(player.hand, state.wall);
+  if (player.drawnTile) {
+    return state;
+  }
+
+  const [tile, ...remainingWall] = state.wall;
   return {
     ...state,
-    wall: drawn.wall,
+    wall: remainingWall,
     players: {
       ...state.players,
-      [seat]: { ...player, hand: drawn.hand }
+      [seat]: { ...player, drawnTile: tile }
     }
+  };
+}
+
+function discardFromPlayer(player: PlayerState, tile: Tile, source: "hand" | "drawn"): { hand: Tile[]; drawnTile: Tile | null; river: Tile[] } {
+  if (source === "drawn") {
+    if (player.drawnTile !== tile) {
+      throw new Error(`Cannot discard ${tile}; it is not the drawn tile.`);
+    }
+    return {
+      hand: sortHand(player.hand),
+      drawnTile: null,
+      river: [...player.river, tile]
+    };
+  }
+
+  const discarded = discardTile(player.hand, player.river, tile);
+  return {
+    hand: sortHand(player.drawnTile ? [...discarded.hand, player.drawnTile] : discarded.hand),
+    drawnTile: null,
+    river: discarded.river
   };
 }
 
