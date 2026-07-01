@@ -5,13 +5,18 @@ import { TileButton } from "@/components/TileButton";
 import {
   CallType,
   GameState,
+  OpenMeld,
+  RiverTile,
   forceKnownTenpaiSetup,
   getPreviouslyGuessedTiles,
+  riverTileSource,
+  riverTileValue,
+  requestNextHand,
   resolveGuess,
   resolveSelfDrawTrial,
-  startNextHandWithRotatedSeats,
   skipCall,
   takeCall,
+  takeChiOption,
   takeDiscard
 } from "@/lib/game";
 import { TILE_TYPES, Tile } from "@/lib/mahjong";
@@ -258,13 +263,10 @@ export default function Home() {
                 }
                 onReset={() =>
                   runAction(async () => {
-                    if (!seat) {
+                    if (!seat || !playerId) {
                       throw new Error("只有本房间玩家可以重开。");
                     }
-                    if (!state.eastPlayerId) {
-                      return;
-                    }
-                    await writeState(startNextHandWithRotatedSeats(state));
+                    await writeState(requestNextHand(state, playerId));
                   })
                 }
                 onForceTenpai={() =>
@@ -281,6 +283,14 @@ export default function Home() {
                       throw new Error("只有可鸣牌的一方可以操作。");
                     }
                     await writeState(takeCall(state, seat, type));
+                  })
+                }
+                onChiOption={(optionIndex) =>
+                  runAction(async () => {
+                    if (!seat || !state.pendingCall || state.pendingCall.responderSeat !== seat) {
+                      throw new Error("只有可鸣牌的一方可以操作。");
+                    }
+                    await writeState(takeChiOption(state, seat, optionIndex));
                   })
                 }
                 onSkipCall={() =>
@@ -378,7 +388,7 @@ function SeatStatus({ label, active, current, mine }: { label: string; active: b
   );
 }
 
-function River({ title, seat, tiles, current }: { title: string; seat: "east" | "south"; tiles: Tile[]; current: boolean }) {
+function River({ title, seat, tiles, current }: { title: string; seat: "east" | "south"; tiles: RiverTile[]; current: boolean }) {
   return (
     <section className={`min-h-[180px] rounded-md border bg-[#efe5d2] p-4 shadow-sm ${current ? "border-ember" : "border-stone-300"}`}>
       <div className="mb-3 flex items-center justify-between gap-2">
@@ -386,7 +396,16 @@ function River({ title, seat, tiles, current }: { title: string; seat: "east" | 
         <span className={`rounded-md px-2 py-1 text-xs font-black uppercase ${current ? "bg-ember text-white" : "bg-white text-stone-600"}`}>{seat === "east" ? "东" : "南"}</span>
       </div>
       <div className="grid min-h-24 grid-cols-6 content-start gap-3 rounded-md border border-stone-300 bg-[#1f6b5a] p-3">
-        {tiles.map((tile, index) => <TileButton key={`${tile}-${index}`} tile={tile} size="river" disabled />)}
+        {tiles.map((entry, index) => {
+          const tile = riverTileValue(entry);
+          const showTedashiMarker = riverTileSource(entry) === "tedashi";
+          return (
+            <div key={`${tile}-${index}`} className="relative w-fit">
+              <TileButton tile={tile} size="river" disabled interactive={false} />
+              {showTedashiMarker && <span className="absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full border border-white/70 bg-slate-600/90 shadow-sm" aria-hidden="true" />}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -403,6 +422,7 @@ function PhasePanel({
   onReset,
   onForceTenpai,
   onCall,
+  onChiOption,
   onSkipCall
 }: {
   state: GameState;
@@ -415,26 +435,48 @@ function PhasePanel({
   onReset: () => void;
   onForceTenpai: () => void;
   onCall: (type: CallType) => void;
+  onChiOption: (optionIndex: number) => void;
   onSkipCall: () => void;
 }) {
   const previouslyGuessedTiles = getPreviouslyGuessedTiles(state);
   const selectedContainsPreviousGuess = selectedGuess.some((tile) => previouslyGuessedTiles.has(tile));
+  const tenpaiDiscardedTiles = new Set((state.tenpaiSeat ? state.players[state.tenpaiSeat]?.river ?? [] : []).map(riverTileValue));
 
   if (state.pendingCall) {
     const canRespond = seat === state.pendingCall.responderSeat;
+    const chiOptions = canRespond ? state.pendingCall.pendingChiOptions ?? [] : [];
+    const choosingChi = chiOptions.length > 0;
     return (
       <section className="rounded-md border border-ember bg-white p-4 shadow-sm">
         <div className="rounded-md bg-ember px-3 py-2 text-white">
-          <h2 className="font-black">正在思考...</h2>
+          <h2 className="font-black">{choosingChi ? "选择吃法" : "正在思考..."}</h2>
           <p className="text-sm font-semibold text-white/90">
-            {canRespond ? "你可以对这张弃牌进行操作。" : "等待对手进行操作。"}
+            {choosingChi ? "请选择要组成的顺子。" : canRespond ? "你可以对这张弃牌进行操作。" : "等待对手进行操作。"}
           </p>
         </div>
         <div className="mt-3 flex items-center gap-3 rounded-md bg-paper p-3">
           <span className="text-sm font-black text-stone-700">对方打出</span>
-          <TileButton tile={state.pendingCall.tile} disabled />
+          <TileButton tile={state.pendingCall.tile} disabled interactive={false} />
         </div>
-        {canRespond && (
+        {choosingChi ? (
+          <div className="mt-4 space-y-2">
+            {chiOptions.map((option, optionIndex) => (
+              <button
+                key={`${option.tiles.join("-")}-${optionIndex}`}
+                type="button"
+                disabled={isBusy}
+                onClick={() => onChiOption(optionIndex)}
+                className="flex w-full items-center justify-between gap-3 rounded-md border border-stone-300 bg-paper px-3 py-2 text-left shadow-sm transition hover:border-felt hover:bg-jade disabled:opacity-50"
+              >
+                <span className="text-sm font-black text-stone-700">吃法 {optionIndex + 1}</span>
+                <ChiOptionTiles tiles={option.tiles} calledTileIndex={option.calledTileIndex} />
+              </button>
+            ))}
+            <button type="button" disabled={isBusy} onClick={onSkipCall} className="w-full rounded-md bg-stone-700 px-4 py-3 font-black text-white disabled:opacity-50">
+              跳过
+            </button>
+          </div>
+        ) : canRespond && (
           <div className="mt-4 grid grid-cols-2 gap-2">
             {state.pendingCall.options.includes("chi") && (
               <button type="button" disabled={isBusy} onClick={() => onCall("chi")} className="rounded-md bg-felt px-4 py-3 font-black text-white disabled:opacity-50">
@@ -466,18 +508,21 @@ function PhasePanel({
     return (
       <section className="rounded-md border border-ember bg-white p-4 shadow-sm">
         <div className="rounded-md bg-ember px-3 py-2 text-white">
-          <h2 className="font-black">猜听牌</h2>
-          <p className="text-sm font-semibold text-white/90">{canGuess ? "你的回合：请选择两个可能的听牌。" : "等待对手猜听牌。"}</p>
+          <h2 className="font-black">Ta在听什么？</h2>
+          <p className="text-sm font-semibold text-white/90">{canGuess ? "选择两张可能的听牌。" : "等待对手猜听牌。"}</p>
         </div>
         <div className="mt-4 grid grid-cols-5 gap-2 sm:grid-cols-6 xl:grid-cols-9">
           {TILE_TYPES.map((tile) => {
             const wasGuessed = previouslyGuessedTiles.has(tile);
+            const wasDiscardedByTenpai = tenpaiDiscardedTiles.has(tile);
             return (
               <div key={tile}>
                 <TileButton
                   tile={tile}
                   size="sm"
                   disabledTone={wasGuessed ? "guessed" : "default"}
+                  tone={!wasGuessed && wasDiscardedByTenpai ? "hint" : "default"}
+                  crossed={wasGuessed}
                   selected={selectedGuess.includes(tile)}
                   disabled={!canGuess || isBusy || wasGuessed}
                   onClick={() => {
@@ -509,35 +554,53 @@ function PhasePanel({
     return (
       <section className="rounded-md border border-felt bg-white p-4 shadow-sm">
         <div className="rounded-md bg-felt px-3 py-2 text-white">
-          <h2 className="font-black">自摸试抽</h2>
-          <p className="text-sm font-semibold text-white/90">{canRun ? "你的回合：进行 5 次锁定试抽。" : "等待对手进行自摸试抽。"}</p>
+          <h2 className="font-black">{canRun ? "没有猜中！" : "非常遗憾！"}</h2>
+          <p className="text-sm font-semibold text-white/90">{canRun ? "现在是你的自摸回合。" : "现在是对手的自摸时间。"}</p>
         </div>
         <p className="mt-3 text-sm font-semibold text-stone-600">听牌形状已锁定，最多从牌山试抽 5 张。</p>
-        <button type="button" disabled={!canRun || isBusy} onClick={onSelfDraw} className="mt-4 w-full rounded-md bg-felt px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
-          开始试抽
-        </button>
+        {canRun && (
+          <button type="button" disabled={isBusy} onClick={onSelfDraw} className="mt-4 w-full rounded-md bg-felt px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
+            开始试抽
+          </button>
+        )}
         <PublicInfoHistory state={state} />
       </section>
     );
   }
 
   if (state.phase === "game_over") {
+    const currentPlayerId = seat ? state.players[seat]?.id : null;
+    const opponentPlayerId =
+      currentPlayerId && currentPlayerId === state.eastPlayerId ? state.southPlayerId : currentPlayerId === state.southPlayerId ? state.eastPlayerId : null;
+    const readyPlayerIds = state.rematchReadyPlayerIds ?? [];
+    const isReadyForRematch = Boolean(currentPlayerId && readyPlayerIds.includes(currentPlayerId));
+    const opponentReadyForRematch = Boolean(opponentPlayerId && readyPlayerIds.includes(opponentPlayerId));
+    const rematchButtonText = opponentReadyForRematch && !isReadyForRematch ? "对手邀请你再来一把！" : isReadyForRematch ? "等待对手回应..." : "再来一把！";
+    const rematchButtonClass =
+      opponentReadyForRematch && !isReadyForRematch
+        ? "border-ember bg-ember text-white shadow-[0_10px_24px_rgba(201,79,55,0.22)] hover:bg-[#b94732]"
+        : "border-ink bg-ink text-white shadow-sm hover:bg-[#223027]";
     return (
       <section className="rounded-md border border-ink bg-white p-4 shadow-sm">
         <div className="rounded-md bg-ink px-3 py-2 text-white">
-          <h2 className="font-black">游戏结束</h2>
+          <h2 className="font-black">{gameOverTitle(state)}</h2>
           <p className="text-sm font-semibold text-white/90">{gameOverText(state)}</p>
         </div>
         <TenpaiShapeReveal state={state} />
         {state.lockedWaits.length > 0 && (
           <div className="mt-3">
             <div className="text-sm font-black text-stone-600">原始听牌</div>
-            <div className="mt-2 flex flex-wrap gap-2">{state.lockedWaits.map((tile) => <TileButton key={tile} tile={tile} disabled />)}</div>
+            <div className="mt-2 flex flex-wrap gap-2">{state.lockedWaits.map((tile) => <TileButton key={tile} tile={tile} disabled interactive={false} />)}</div>
           </div>
         )}
         <PublicInfoHistory state={state} />
-        <button type="button" disabled={isBusy || !seat} onClick={onReset} className="mt-4 w-full rounded-md bg-ink px-4 py-3 font-black text-white shadow-sm disabled:opacity-50">
-          下一局
+        <button
+          type="button"
+          disabled={isBusy || !seat || isReadyForRematch}
+          onClick={onReset}
+          className={`mt-4 w-full rounded-md border px-4 py-3 font-black transition disabled:pointer-events-none disabled:opacity-50 ${rematchButtonClass}`}
+        >
+          {rematchButtonText}
         </button>
       </section>
     );
@@ -587,16 +650,48 @@ function MeldRow({ title, melds }: { title: string; melds: NonNullable<GameState
         {melds.map((meld, meldIndex) => (
           <div key={`${meld.type}-${meldIndex}`} className="rounded-md border border-stone-200 bg-paper p-2">
             <div className="mb-2 text-xs font-black text-stone-600">{callLabel(meld.type)}</div>
-            <div className="flex gap-1">
-              {meld.tiles.map((tile, tileIndex) => (
-                <TileButton key={`${tile}-${tileIndex}`} tile={tile} disabled />
-              ))}
-            </div>
+            <OpenMeldTiles meld={meld} />
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function OpenMeldTiles({ meld }: { meld: OpenMeld }) {
+  const calledTileIndex = getCalledTileIndex(meld);
+  return <SidewaysTileGroup tiles={meld.tiles} calledTileIndex={calledTileIndex} />;
+}
+
+function ChiOptionTiles({ tiles, calledTileIndex }: { tiles: Tile[]; calledTileIndex: number }) {
+  return <SidewaysTileGroup tiles={tiles} calledTileIndex={calledTileIndex} />;
+}
+
+function SidewaysTileGroup({ tiles, calledTileIndex }: { tiles: Tile[]; calledTileIndex: number }) {
+  return (
+    <div className="flex min-h-[62px] items-center gap-1.5">
+      {tiles.map((tile, tileIndex) => {
+        const sideways = tileIndex === calledTileIndex;
+        return (
+          <div key={`${tile}-${tileIndex}`} className={sideways ? "grid h-[44px] w-[62px] place-items-center" : "grid h-[62px] w-[43px] place-items-center"}>
+            <div className={sideways ? "rotate-90" : undefined}>
+              <TileButton tile={tile} size="river" disabled interactive={false} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function getCalledTileIndex(meld: OpenMeld): number {
+  if (Number.isInteger(meld.calledTileIndex)) {
+    return meld.calledTileIndex;
+  }
+  if (meld.type === "pon" || meld.type === "kan") {
+    return 1;
+  }
+  return Math.max(0, meld.tiles.indexOf(meld.calledTile));
 }
 
 function callLabel(type: CallType): string {
@@ -636,7 +731,7 @@ function TenpaiShapeReveal({ state }: { state: GameState }) {
       <div className="text-sm font-black text-stone-700">听牌人牌型 · {state.tenpaiSeat === "east" ? "东家" : "南家"}</div>
       <div className="mt-2 flex flex-wrap gap-1.5">
         {tenpaiPlayer.hand.map((tile, index) => (
-          <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled />
+          <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled interactive={false} />
         ))}
       </div>
       {(tenpaiPlayer.melds ?? []).length > 0 && (
@@ -645,9 +740,7 @@ function TenpaiShapeReveal({ state }: { state: GameState }) {
           {(tenpaiPlayer.melds ?? []).map((meld, meldIndex) => (
             <div key={`${meld.type}-${meldIndex}`} className="flex flex-wrap items-center gap-1.5">
               <span className="mr-1 text-xs font-black text-stone-600">{callLabel(meld.type)}</span>
-              {meld.tiles.map((tile, tileIndex) => (
-                <TileButton key={`${tile}-${tileIndex}`} tile={tile} size="info" disabled />
-              ))}
+              <OpenMeldTiles meld={meld} />
             </div>
           ))}
         </div>
@@ -675,7 +768,7 @@ function PublicInfoHistory({ state }: { state: GameState }) {
               <div className="w-20 shrink-0 text-sm font-black text-stone-700">第{roundIndex + 1}轮猜牌</div>
               <div className="flex flex-wrap gap-1.5">
                 {guess.guessedTiles.map((tile, tileIndex) => (
-                  <TileButton key={`${tile}-${tileIndex}`} tile={tile} size="info" disabled />
+                  <TileButton key={`${tile}-${tileIndex}`} tile={tile} size="info" disabled interactive={false} />
                 ))}
               </div>
             </div>
@@ -684,7 +777,7 @@ function PublicInfoHistory({ state }: { state: GameState }) {
                 <div className="w-20 shrink-0 text-sm font-black text-stone-700">第{roundIndex + 1}轮自摸</div>
                 <div className="flex flex-wrap gap-1.5">
                   {attempt.draws.map((tile, index) => (
-                    <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} />
+                    <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} interactive={false} />
                   ))}
                 </div>
                 <div className={`ml-auto rounded-md px-2 py-1 text-xs font-black ${attempt.won ? "bg-felt text-white" : "bg-stone-200 text-stone-700"}`}>
@@ -705,7 +798,7 @@ function PublicInfoHistory({ state }: { state: GameState }) {
               <div className="w-20 shrink-0 text-sm font-black text-stone-700">自摸挑战</div>
               <div className="flex flex-wrap gap-1.5">
                 {attempt.draws.map((tile, index) => (
-                  <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} />
+                  <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled selected={attempt.hitTile === tile} interactive={false} />
                 ))}
               </div>
               <div className={`ml-auto rounded-md px-2 py-1 text-xs font-black ${attempt.won ? "bg-felt text-white" : "bg-stone-200 text-stone-700"}`}>
@@ -727,4 +820,14 @@ function gameOverText(state: GameState): string {
     return `${state.winnerSeat === "east" ? "东家" : "南家"}在 5 次试抽内自摸获胜。`;
   }
   return "牌山耗尽，流局。";
+}
+
+function gameOverTitle(state: GameState): string {
+  if (state.winReason === "guesser_correct") {
+    return "猜对了！";
+  }
+  if (state.winReason === "self_draw") {
+    return "自摸！";
+  }
+  return "流局";
 }

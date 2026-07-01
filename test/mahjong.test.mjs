@@ -12,12 +12,16 @@ import {
 } from "../src/lib/mahjong.ts";
 import {
   forceKnownTenpaiSetup,
+  getChiOptions,
   getPreviouslyGuessedTiles,
   joinGame,
   resetGameKeepingPlayers,
+  requestNextHand,
   resolveGuess,
   resolveSelfDrawTrial,
   startNextHandWithRotatedSeats,
+  takeCall,
+  takeChiOption,
   takeDraw,
   takeDiscard
 } from "../src/lib/game.ts";
@@ -184,7 +188,7 @@ test("discard advances turn and automatically draws for the next player", () => 
   const next = takeDiscard(state, "east", "C");
   assert.equal(next.phase, "draw_discard");
   assert.equal(next.currentTurn, "south");
-  assert.deepEqual(next.players.east.river, ["C"]);
+  assert.deepEqual(next.players.east.river, [{ tile: "C", source: "tsumogiri" }]);
   assert.equal(next.players.east.hand.length, 13);
   assert.equal(next.players.south.hand.length, 13);
   assert.equal(next.players.south.drawnTile, "9m");
@@ -261,7 +265,7 @@ test("drawn tile can be discarded directly as tsumogiri", () => {
   };
 
   const next = takeDiscard(state, "south", "9m", "drawn");
-  assert.deepEqual(next.players.south.river, ["9m"]);
+  assert.deepEqual(next.players.south.river, [{ tile: "9m", source: "tsumogiri" }]);
   assert.equal(next.players.south.hand.length, 13);
   assert.equal(next.players.south.drawnTile, null);
 });
@@ -297,7 +301,7 @@ test("discarding from main hand merges drawn tile afterward", () => {
   };
 
   const next = takeDiscard(state, "south", "N", "hand");
-  assert.deepEqual(next.players.south.river, ["N"]);
+  assert.deepEqual(next.players.south.river, [{ tile: "N", source: "tedashi" }]);
   assert.equal(next.players.south.hand.includes("9m"), true);
   assert.equal(next.players.south.hand.length, 13);
   assert.equal(next.players.south.drawnTile, null);
@@ -498,6 +502,153 @@ test("next hand clears guess and self-draw history", () => {
   assert.deepEqual([...getPreviouslyGuessedTiles(next)], []);
 });
 
+test("requesting next hand waits until both players confirm", () => {
+  const state = {
+    roomCode: "REMATCH1",
+    phase: "game_over",
+    currentTurn: "south",
+    eastPlayerId: "player-a",
+    southPlayerId: "player-b",
+    players: {
+      east: { id: "player-a", seat: "east", hand: [], river: [], isConnected: true },
+      south: { id: "player-b", seat: "south", hand: [], river: [], isConnected: true }
+    },
+    pendingSouthHand: [],
+    wall: [],
+    tenpaiSeat: "east",
+    guesserSeat: "south",
+    lockedWaits: ["5m"],
+    pendingCall: null,
+    guessHistory: [{ guessedTiles: ["5m", "9m"], correct: true }],
+    selfDrawAttempts: [],
+    rematchReadyPlayerIds: [],
+    winnerSeat: "south",
+    winReason: "guesser_correct"
+  };
+
+  const invited = requestNextHand(state, "player-a");
+  assert.equal(invited.phase, "game_over");
+  assert.deepEqual(invited.rematchReadyPlayerIds, ["player-a"]);
+
+  const next = requestNextHand(invited, "player-b");
+  assert.equal(next.phase, "draw_discard");
+  assert.equal(next.eastPlayerId, "player-b");
+  assert.equal(next.southPlayerId, "player-a");
+  assert.equal(next.players.east.hand.length, 14);
+  assert.equal(next.players.south.hand.length, 13);
+  assert.deepEqual(next.rematchReadyPlayerIds, []);
+});
+
+test("spectators cannot request the next hand", () => {
+  const state = {
+    roomCode: "REMATCH2",
+    phase: "game_over",
+    currentTurn: "east",
+    eastPlayerId: "player-a",
+    southPlayerId: "player-b",
+    players: {
+      east: { id: "player-a", seat: "east", hand: [], river: [], isConnected: true },
+      south: { id: "player-b", seat: "south", hand: [], river: [], isConnected: true }
+    },
+    pendingSouthHand: [],
+    wall: [],
+    tenpaiSeat: null,
+    guesserSeat: null,
+    lockedWaits: [],
+    pendingCall: null,
+    guessHistory: [],
+    selfDrawAttempts: [],
+    winnerSeat: null,
+    winReason: "exhaustive_draw"
+  };
+
+  assert.throws(() => requestNextHand(state, "spectator"), /Only seated players/);
+});
+
+test("chi open meld stores the called tile at its real sorted position", () => {
+  const state = callState({
+    tile: "5s",
+    type: "chi",
+    southHand: ["4s", "6s", "1m", "2m", "3m"]
+  });
+
+  const next = takeCall(state, "south", "chi");
+  const meld = next.players.south.melds.at(-1);
+  assert.deepEqual(meld.tiles, ["4s", "5s", "6s"]);
+  assert.equal(meld.calledTileIndex, 1);
+  assert.equal(meld.calledTile, "5s");
+  assert.deepEqual(next.players.east.river, []);
+});
+
+test("multiple chi options are detected for the same discard", () => {
+  const options = getChiOptions("7s", ["6s", "7s", "8s", "9s", "1m"]);
+  assert.deepEqual(options.map((option) => option.tiles), [
+    ["6s", "7s", "8s"],
+    ["7s", "8s", "9s"]
+  ]);
+  assert.deepEqual(options.map((option) => option.calledTileIndex), [1, 0]);
+});
+
+test("taking chi with multiple options asks for a chi pattern before creating a meld", () => {
+  const state = callState({
+    tile: "7s",
+    type: "chi",
+    southHand: ["6s", "7s", "8s", "9s", "1m"]
+  });
+
+  const choosing = takeCall(state, "south", "chi");
+  assert.equal(choosing.pendingCall.responderSeat, "south");
+  assert.equal(choosing.pendingCall.pendingChiOptions.length, 2);
+  assert.equal(choosing.players.south.melds.length, 0);
+  assert.deepEqual(choosing.players.east.river, ["7s"]);
+});
+
+test("selecting a chi option creates the chosen meld with the correct called tile index", () => {
+  const state = callState({
+    tile: "7s",
+    type: "chi",
+    southHand: ["6s", "7s", "8s", "9s", "1m"]
+  });
+
+  const choosing = takeCall(state, "south", "chi");
+  const next = takeChiOption(choosing, "south", 1);
+  const meld = next.players.south.melds.at(-1);
+  assert.deepEqual(meld.tiles, ["7s", "8s", "9s"]);
+  assert.deepEqual(next.players.south.hand, ["1m", "6s", "7s"]);
+  assert.equal(meld.calledTileIndex, 0);
+  assert.equal(meld.calledTile, "7s");
+  assert.equal(next.pendingCall, null);
+  assert.deepEqual(next.players.east.river, []);
+});
+
+test("pon open meld stores the middle tile as sideways", () => {
+  const state = callState({
+    tile: "5p",
+    type: "pon",
+    southHand: ["5p", "5p", "1m", "2m", "3m"]
+  });
+
+  const next = takeCall(state, "south", "pon");
+  const meld = next.players.south.melds.at(-1);
+  assert.deepEqual(meld.tiles, ["5p", "5p", "5p"]);
+  assert.equal(meld.calledTileIndex, 1);
+});
+
+test("kan open meld stores the second tile as sideways", () => {
+  const state = callState({
+    tile: "7m",
+    type: "kan",
+    southHand: ["7m", "7m", "7m", "1p", "2p"],
+    wall: ["9s"]
+  });
+
+  const next = takeCall(state, "south", "kan");
+  const meld = next.players.south.melds.at(-1);
+  assert.deepEqual(meld.tiles, ["7m", "7m", "7m", "7m"]);
+  assert.equal(meld.calledTileIndex, 1);
+  assert.equal(next.players.south.drawnTile, "9s");
+});
+
 test("self-draw trial stops early when a revealed tile hits the locked wait", () => {
   const state = {
     roomCode: "TRIAL2",
@@ -528,3 +679,32 @@ test("self-draw trial stops early when a revealed tile hits the locked wait", ()
   assert.equal(afterTrial.selfDrawAttempts.at(-1).won, true);
   assert.equal(afterTrial.selfDrawAttempts.at(-1).hitTile, "5m");
 });
+
+function callState({ tile, type, southHand, wall = [] }) {
+  return {
+    roomCode: "CALL1",
+    phase: "draw_discard",
+    currentTurn: "south",
+    eastPlayerId: "east-player",
+    southPlayerId: "south-player",
+    players: {
+      east: { id: "east-player", seat: "east", hand: [], river: [tile], isConnected: true },
+      south: { id: "south-player", seat: "south", hand: southHand, river: [], melds: [], isConnected: true }
+    },
+    pendingSouthHand: [],
+    wall,
+    tenpaiSeat: null,
+    guesserSeat: null,
+    lockedWaits: [],
+    pendingCall: {
+      discarderSeat: "east",
+      responderSeat: "south",
+      tile,
+      options: [type]
+    },
+    guessHistory: [],
+    selfDrawAttempts: [],
+    winnerSeat: null,
+    winReason: null
+  };
+}

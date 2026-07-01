@@ -5,7 +5,6 @@ import {
   checkGuessAgainstWaits,
   createWall,
   dealInitialHands,
-  discardTile,
   getWinningTilesForTenpai,
   runSelfDrawTrial,
   shuffleWall,
@@ -17,16 +16,20 @@ export type PlayerState = {
   seat: Seat;
   hand: Tile[];
   drawnTile?: Tile | null;
-  river: Tile[];
+  river: RiverTile[];
   melds?: OpenMeld[];
   isConnected: boolean;
 };
 
 export type CallType = "chi" | "pon" | "kan";
+export type DiscardSource = "tsumogiri" | "tedashi";
+export type RiverEntry = { tile: Tile; source: DiscardSource };
+export type RiverTile = Tile | RiverEntry;
 
 export type OpenMeld = {
   type: CallType;
   tiles: Tile[];
+  calledTileIndex: number;
   calledTile: Tile;
   fromSeat: Seat;
 };
@@ -36,6 +39,13 @@ export type PendingCall = {
   responderSeat: Seat;
   tile: Tile;
   options: CallType[];
+  pendingChiOptions?: ChiOption[];
+};
+
+export type ChiOption = {
+  tiles: Tile[];
+  consumedTiles: Tile[];
+  calledTileIndex: number;
 };
 
 export type GuessRecord = {
@@ -65,6 +75,7 @@ export type GameState = {
   pendingCall: PendingCall | null;
   guessHistory: GuessRecord[];
   selfDrawAttempts: SelfDrawRecord[];
+  rematchReadyPlayerIds?: string[];
   winnerSeat: Seat | null;
   winReason: "guesser_correct" | "self_draw" | "exhaustive_draw" | null;
 };
@@ -98,6 +109,7 @@ export function createInitialGame(roomCode: string, eastPlayerId: string, random
     pendingCall: null,
     guessHistory: [],
     selfDrawAttempts: [],
+    rematchReadyPlayerIds: [],
     winnerSeat: null,
     winReason: null
   };
@@ -144,6 +156,26 @@ export function startNextHandWithRotatedSeats(state: GameState, random = Math.ra
 
   const next = createInitialGame(state.roomCode, state.southPlayerId, random);
   return joinGame(next, state.eastPlayerId);
+}
+
+export function requestNextHand(state: GameState, playerId: string, random = Math.random): GameState {
+  assertPhase(state, "game_over");
+  if (!state.eastPlayerId || !state.southPlayerId) {
+    throw new Error("Cannot start the next hand without two players.");
+  }
+  if (playerId !== state.eastPlayerId && playerId !== state.southPlayerId) {
+    throw new Error("Only seated players can request the next hand.");
+  }
+
+  const readyPlayerIds = Array.from(new Set([...(state.rematchReadyPlayerIds ?? []), playerId]));
+  if (readyPlayerIds.includes(state.eastPlayerId) && readyPlayerIds.includes(state.southPlayerId)) {
+    return startNextHandWithRotatedSeats(state, random);
+  }
+
+  return {
+    ...state,
+    rematchReadyPlayerIds: readyPlayerIds
+  };
 }
 
 export function forceKnownTenpaiSetup(state: GameState, seat: Seat): GameState {
@@ -218,7 +250,7 @@ export function takeDiscard(state: GameState, seat: Seat, tile: Tile, source: "h
     throw new Error("Call decision is pending.");
   }
   const player = requirePlayer(state, seat);
-  const discarded = discardFromPlayer(player, tile, source);
+  const discarded = discardFromPlayer(player, seat, tile, source);
   const nextSeat = seat === "east" ? "south" : "east";
   const nextState: GameState = {
     ...state,
@@ -265,10 +297,45 @@ export function takeCall(state: GameState, seat: Seat, type: CallType): GameStat
 
   const caller = requirePlayer(state, seat);
   const discarder = requirePlayer(state, pendingCall.discarderSeat);
+  if (type === "chi") {
+    const chiOptions = getChiOptions(pendingCall.tile, caller.hand);
+    if (chiOptions.length > 1 && !pendingCall.pendingChiOptions) {
+      return {
+        ...state,
+        pendingCall: {
+          ...pendingCall,
+          pendingChiOptions: chiOptions
+        }
+      };
+    }
+  }
+
   const consumedTiles = getConsumedTilesForCall(type, pendingCall.tile, caller.hand);
+  return completeCall(state, seat, type, consumedTiles);
+}
+
+export function takeChiOption(state: GameState, seat: Seat, optionIndex: number): GameState {
+  assertPhase(state, "draw_discard");
+  const pendingCall = requirePendingCall(state, seat);
+  if (!pendingCall.options.includes("chi")) {
+    throw new Error("chi is not available.");
+  }
+  const chiOption = pendingCall.pendingChiOptions?.[optionIndex];
+  if (!chiOption) {
+    throw new Error("Chi option is not available.");
+  }
+
+  return completeCall(state, seat, "chi", chiOption.consumedTiles);
+}
+
+function completeCall(state: GameState, seat: Seat, type: CallType, consumedTiles: Tile[]): GameState {
+  const pendingCall = requirePendingCall(state, seat);
+  const caller = requirePlayer(state, seat);
+  const discarder = requirePlayer(state, pendingCall.discarderSeat);
+  const openMeld = createOpenMeld(type, consumedTiles, pendingCall.tile, pendingCall.discarderSeat);
   const nextCallerHand = removeTiles(caller.hand, consumedTiles);
   const nextDiscarderRiver = [...discarder.river];
-  const calledTileIndex = nextDiscarderRiver.lastIndexOf(pendingCall.tile);
+  const calledTileIndex = findLastRiverTileIndex(nextDiscarderRiver, pendingCall.tile);
   if (calledTileIndex !== -1) {
     nextDiscarderRiver.splice(calledTileIndex, 1);
   }
@@ -285,12 +352,7 @@ export function takeCall(state: GameState, seat: Seat, type: CallType): GameStat
         hand: sortHand(nextCallerHand),
         melds: [
           ...(caller.melds ?? []),
-          {
-            type,
-            tiles: sortHand([...consumedTiles, pendingCall.tile]),
-            calledTile: pendingCall.tile,
-            fromSeat: pendingCall.discarderSeat
-          }
+          openMeld
         ]
       }
     }
@@ -443,11 +505,37 @@ function getConsumedTilesForCall(type: CallType, tile: Tile, hand: Tile[]): Tile
     return [tile, tile, tile];
   }
 
-  const combo = getChiCombos(tile, hand)[0];
+  const combo = getChiOptions(tile, hand)[0]?.consumedTiles;
   if (!combo) {
     throw new Error("No chi combination is available.");
   }
   return combo;
+}
+
+function createOpenMeld(type: CallType, consumedTiles: Tile[], calledTile: Tile, fromSeat: Seat): OpenMeld {
+  const tiles = type === "chi" ? createChiMeldTiles(consumedTiles, calledTile) : sortHand([...consumedTiles, calledTile]);
+  return {
+    type,
+    tiles,
+    calledTileIndex: type === "chi" ? tiles.indexOf(calledTile) : 1,
+    calledTile,
+    fromSeat
+  };
+}
+
+export function getChiOptions(tile: Tile, hand: Tile[]): ChiOption[] {
+  return getChiCombos(tile, hand).map((consumedTiles) => {
+    const tiles = createChiMeldTiles(consumedTiles, tile);
+    return {
+      tiles,
+      consumedTiles,
+      calledTileIndex: tiles.indexOf(tile)
+    };
+  });
+}
+
+function createChiMeldTiles(consumedTiles: Tile[], calledTile: Tile): Tile[] {
+  return sortHand([...consumedTiles, calledTile]);
 }
 
 function getChiCombos(tile: Tile, hand: Tile[]): Tile[][] {
@@ -526,7 +614,16 @@ function drawForTurnStart(state: GameState, seat: Seat): GameState {
   };
 }
 
-function discardFromPlayer(player: PlayerState, tile: Tile, source: "hand" | "drawn"): { hand: Tile[]; drawnTile: Tile | null; river: Tile[] } {
+export function riverTileValue(entry: RiverTile): Tile {
+  return typeof entry === "string" ? entry : entry.tile;
+}
+
+export function riverTileSource(entry: RiverTile): DiscardSource {
+  return typeof entry === "string" ? "tsumogiri" : entry.source;
+}
+
+function discardFromPlayer(player: PlayerState, seat: Seat, tile: Tile, source: "hand" | "drawn"): { hand: Tile[]; drawnTile: Tile | null; river: RiverTile[] } {
+  const riverEntry = createRiverEntry(player, seat, tile, source);
   if (source === "drawn") {
     if (player.drawnTile !== tile) {
       throw new Error(`Cannot discard ${tile}; it is not the drawn tile.`);
@@ -534,16 +631,44 @@ function discardFromPlayer(player: PlayerState, tile: Tile, source: "hand" | "dr
     return {
       hand: sortHand(player.hand),
       drawnTile: null,
-      river: [...player.river, tile]
+      river: [...player.river, riverEntry]
     };
   }
 
-  const discarded = discardTile(player.hand, player.river, tile);
+  const nextHand = removeTileFromHand(player.hand, tile);
   return {
-    hand: sortHand(player.drawnTile ? [...discarded.hand, player.drawnTile] : discarded.hand),
+    hand: sortHand(player.drawnTile ? [...nextHand, player.drawnTile] : nextHand),
     drawnTile: null,
-    river: discarded.river
+    river: [...player.river, riverEntry]
   };
+}
+
+function createRiverEntry(player: PlayerState, seat: Seat, tile: Tile, source: "hand" | "drawn"): RiverEntry {
+  const isEastFirstDiscard = seat === "east" && player.river.length === 0;
+  return {
+    tile,
+    source: source === "drawn" || isEastFirstDiscard ? "tsumogiri" : "tedashi"
+  };
+}
+
+function removeTileFromHand(hand: Tile[], tile: Tile): Tile[] {
+  const index = hand.indexOf(tile);
+  if (index === -1) {
+    throw new Error(`Cannot discard ${tile}; it is not in the hand.`);
+  }
+
+  const nextHand = [...hand];
+  nextHand.splice(index, 1);
+  return nextHand;
+}
+
+function findLastRiverTileIndex(river: RiverTile[], tile: Tile): number {
+  for (let index = river.length - 1; index >= 0; index -= 1) {
+    if (riverTileValue(river[index]) === tile) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function endExhaustiveDraw(state: GameState): GameState {
