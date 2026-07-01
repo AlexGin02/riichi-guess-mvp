@@ -1,6 +1,10 @@
-# Riichi Guess MVP
+# Riichi Guess
 
 A minimal two-player Japanese Riichi Mahjong variant for remote play. Two people open the same deployed URL, create or join a room, play draw/discard until tenpai, guess the wait, and resolve by guessing or locked self-draw trials.
+
+Current release: `v1.0.0` — First Stable Release.
+
+Previous first playable beta: `v0.9.0-beta.1`.
 
 ## Local Run
 
@@ -34,7 +38,7 @@ The app writes:
 - `rooms`: authoritative room and `game_state` JSON
 - `players`: mirrored player hand/river rows for future hardening
 
-For MVP playability, `supabase/schema.sql` creates permissive anonymous RLS policies for select/insert/update on both tables. This is intentionally permissive for testing with remote friends and is not a production security model.
+For current remote playability, `supabase/schema.sql` creates permissive anonymous RLS policies for select/insert/update on both tables. This is intentionally permissive for testing with remote friends and is not a production security model.
 
 Realtime sync uses Postgres changes on the active `rooms` row. Every game action updates `rooms.game_state`; the other browser receives that update through Supabase Realtime.
 
@@ -100,7 +104,7 @@ Database permission error: re-run `supabase/schema.sql`; it creates permissive a
 
 Vercel build failure: run `npm install`, `npm run lint`, and `npm run build` locally. Fix the first reported error and confirm Vercel has both env vars.
 
-## MVP Rule Assumptions
+## Rule Assumptions
 
 - Tenpai is detected after each discard by checking both players' 13-tile hands.
 - If both players are tenpai after a discard, East is selected first.
@@ -110,4 +114,4 @@ Vercel build failure: run `npm install`, `npm run lint`, and `npm run build` loc
 - Self-draw trials do not alter the tenpai player's hand and do not recalculate waits.
 - Guessing uses tile types, not physical tile instances.
 - The UI does not render the opponent's full hand.
-- Locked waits are not shown before game over, but MVP state is client-accessible through Supabase JSON. True secrecy requires Supabase Edge Functions or another trusted server.
+- Locked waits are not shown before game over, but current state is client-accessible through Supabase JSON. True secrecy requires Supabase Edge Functions or another trusted server.
