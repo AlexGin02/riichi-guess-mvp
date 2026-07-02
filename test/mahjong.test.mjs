@@ -13,6 +13,8 @@ import {
 import {
   forceKnownTenpaiSetup,
   getChiOptions,
+  getGuessCandidateViewState,
+  getPublicHintedGuessTiles,
   getPreviouslyGuessedTiles,
   joinGame,
   resetGameKeepingPlayers,
@@ -471,6 +473,61 @@ test("multiple guess and self-draw rounds preserve public history", () => {
     ["7m", "8m", "9m", "1p", "2p"]
   ]);
   assert.equal(secondTrial.selfDrawAttempts.every((attempt) => attempt.won === false), true);
+});
+
+test("failed self-draw trial tiles are public grey hints for the next guess", () => {
+  const state = {
+    roomCode: "HINT1",
+    phase: "guessing",
+    currentTurn: "south",
+    eastPlayerId: "east-player",
+    southPlayerId: "south-player",
+    players: {
+      east: { id: "east-player", seat: "east", hand: [], river: [{ tile: "9p", source: "tedashi" }], isConnected: true },
+      south: { id: "south-player", seat: "south", hand: [], river: [], isConnected: true }
+    },
+    pendingSouthHand: [],
+    wall: [],
+    tenpaiSeat: "east",
+    guesserSeat: "south",
+    lockedWaits: ["5m"],
+    pendingCall: null,
+    guessHistory: [{ guessedTiles: ["7m", "8m"], correct: false }],
+    selfDrawAttempts: [{ draws: ["1m", "2m", "3m", "4m", "6m"], hitTile: null, won: false }],
+    winnerSeat: null,
+    winReason: null
+  };
+
+  assert.deepEqual([...getPublicHintedGuessTiles(state)].sort(), ["1m", "2m", "3m", "4m", "6m", "9p"]);
+  assert.deepEqual(getGuessCandidateViewState(state, "1m"), { hinted: true, disabled: false, crossed: false });
+  assert.deepEqual(getGuessCandidateViewState(state, "9p"), { hinted: true, disabled: false, crossed: false });
+});
+
+test("previously guessed tiles take priority over failed self-draw hints", () => {
+  const state = {
+    roomCode: "HINT2",
+    phase: "guessing",
+    currentTurn: "south",
+    eastPlayerId: "east-player",
+    southPlayerId: "south-player",
+    players: {
+      east: { id: "east-player", seat: "east", hand: [], river: [], isConnected: true },
+      south: { id: "south-player", seat: "south", hand: [], river: [], isConnected: true }
+    },
+    pendingSouthHand: [],
+    wall: [],
+    tenpaiSeat: "east",
+    guesserSeat: "south",
+    lockedWaits: ["5m"],
+    pendingCall: null,
+    guessHistory: [{ guessedTiles: ["1m", "8m"], correct: false }],
+    selfDrawAttempts: [{ draws: ["1m", "2m", "3m", "4m", "6m"], hitTile: null, won: false }],
+    winnerSeat: null,
+    winReason: null
+  };
+
+  assert.deepEqual(getGuessCandidateViewState(state, "1m"), { hinted: false, disabled: true, crossed: true });
+  assert.deepEqual(getGuessCandidateViewState(state, "2m"), { hinted: true, disabled: false, crossed: false });
 });
 
 test("next hand clears guess and self-draw history", () => {

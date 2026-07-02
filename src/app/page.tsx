@@ -8,6 +8,7 @@ import {
   OpenMeld,
   RiverTile,
   forceKnownTenpaiSetup,
+  getGuessCandidateViewState,
   getPreviouslyGuessedTiles,
   riverTileSource,
   riverTileValue,
@@ -440,7 +441,6 @@ function PhasePanel({
 }) {
   const previouslyGuessedTiles = getPreviouslyGuessedTiles(state);
   const selectedContainsPreviousGuess = selectedGuess.some((tile) => previouslyGuessedTiles.has(tile));
-  const tenpaiDiscardedTiles = new Set((state.tenpaiSeat ? state.players[state.tenpaiSeat]?.river ?? [] : []).map(riverTileValue));
 
   if (state.pendingCall) {
     const canRespond = seat === state.pendingCall.responderSeat;
@@ -513,20 +513,19 @@ function PhasePanel({
         </div>
         <div className="mt-4 grid grid-cols-5 gap-2 sm:grid-cols-6 xl:grid-cols-9">
           {TILE_TYPES.map((tile) => {
-            const wasGuessed = previouslyGuessedTiles.has(tile);
-            const wasDiscardedByTenpai = tenpaiDiscardedTiles.has(tile);
+            const viewState = getGuessCandidateViewState(state, tile);
             return (
               <div key={tile}>
                 <TileButton
                   tile={tile}
                   size="sm"
-                  disabledTone={wasGuessed ? "guessed" : "default"}
-                  tone={!wasGuessed && wasDiscardedByTenpai ? "hint" : "default"}
-                  crossed={wasGuessed}
+                  disabledTone={viewState.disabled ? "guessed" : "default"}
+                  tone={viewState.hinted ? "hint" : "default"}
+                  crossed={viewState.crossed}
                   selected={selectedGuess.includes(tile)}
-                  disabled={!canGuess || isBusy || wasGuessed}
+                  disabled={!canGuess || isBusy || viewState.disabled}
                   onClick={() => {
-                    if (wasGuessed) {
+                    if (viewState.disabled) {
                       return;
                     }
                     if (selectedGuess.includes(tile)) {

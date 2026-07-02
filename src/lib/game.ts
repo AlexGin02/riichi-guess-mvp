@@ -60,6 +60,12 @@ export type SelfDrawRecord = {
   won: boolean;
 };
 
+export type GuessCandidateViewState = {
+  hinted: boolean;
+  disabled: boolean;
+  crossed: boolean;
+};
+
 export type GameState = {
   roomCode: string;
   phase: Phase;
@@ -437,6 +443,21 @@ export function resolveSelfDrawTrial(state: GameState, maxDraws = 5): GameState 
 
 export function getPreviouslyGuessedTiles(state: Pick<GameState, "guessHistory">): Set<Tile> {
   return new Set((state.guessHistory ?? []).flatMap((guess) => guess.guessedTiles));
+}
+
+export function getPublicHintedGuessTiles(state: Pick<GameState, "players" | "tenpaiSeat" | "selfDrawAttempts">): Set<Tile> {
+  const tenpaiRiverTiles = state.tenpaiSeat ? state.players[state.tenpaiSeat]?.river.map(riverTileValue) ?? [] : [];
+  const failedSelfDrawTiles = (state.selfDrawAttempts ?? []).filter((attempt) => !attempt.won).flatMap((attempt) => attempt.draws);
+  return new Set([...tenpaiRiverTiles, ...failedSelfDrawTiles]);
+}
+
+export function getGuessCandidateViewState(state: Pick<GameState, "guessHistory" | "players" | "tenpaiSeat" | "selfDrawAttempts">, tile: Tile): GuessCandidateViewState {
+  const wasGuessed = getPreviouslyGuessedTiles(state).has(tile);
+  return {
+    hinted: !wasGuessed && getPublicHintedGuessTiles(state).has(tile),
+    disabled: wasGuessed,
+    crossed: wasGuessed
+  };
 }
 
 export function publicStateForSeat(state: GameState, viewerSeat: Seat | null): GameState {
