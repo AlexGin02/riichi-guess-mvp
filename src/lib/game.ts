@@ -32,6 +32,14 @@ export type OpenMeld = {
   calledTileIndex: number;
   calledTile: Tile;
   fromSeat: Seat;
+  concealed?: boolean;
+  kanSubtype?: "open" | "added" | "concealed";
+};
+
+export type MeldTileView = {
+  tile: Tile | null;
+  hidden: boolean;
+  sideways: boolean;
 };
 
 export type PendingCall = {
@@ -68,6 +76,7 @@ export type GuessCandidateViewState = {
 
 export type GameState = {
   roomCode: string;
+  handNumber?: number;
   phase: Phase;
   currentTurn: Seat;
   eastPlayerId: string | null;
@@ -75,10 +84,17 @@ export type GameState = {
   players: Record<Seat, PlayerState | null>;
   pendingSouthHand: Tile[];
   wall: Tile[];
+  deadWall?: Tile[];
+  doraIndicators?: Tile[];
+  uraDoraIndicators?: Tile[];
+  rinshanTiles?: Tile[];
+  revealedDoraCount?: number;
+  pendingDoraRevealAfterDiscardSeat?: Seat | null;
   tenpaiSeat: Seat | null;
   guesserSeat: Seat | null;
   lockedWaits: Tile[];
   pendingCall: PendingCall | null;
+  callPromptSettings?: Record<string, boolean>;
   guessHistory: GuessRecord[];
   selfDrawAttempts: SelfDrawRecord[];
   rematchReadyPlayerIds?: string[];
@@ -86,11 +102,13 @@ export type GameState = {
   winReason: "guesser_correct" | "self_draw" | "exhaustive_draw" | null;
 };
 
-export function createInitialGame(roomCode: string, eastPlayerId: string, random = Math.random): GameState {
+export function createInitialGame(roomCode: string, eastPlayerId: string, random = Math.random, handNumber = 1): GameState {
   const wall = shuffleWall(createWall(), random);
-  const deal = dealInitialHands(wall);
+  const { liveWall, deadWall } = reserveDeadWall(wall);
+  const deal = dealInitialHands(liveWall);
   return {
     roomCode,
+    handNumber,
     phase: "waiting",
     currentTurn: "east",
     eastPlayerId,
@@ -109,10 +127,17 @@ export function createInitialGame(roomCode: string, eastPlayerId: string, random
     },
     pendingSouthHand: deal.southHand,
     wall: deal.wall,
+    deadWall,
+    doraIndicators: deadWall.slice(0, 5),
+    uraDoraIndicators: deadWall.slice(5, 10),
+    rinshanTiles: deadWall.slice(10, 14),
+    revealedDoraCount: 1,
+    pendingDoraRevealAfterDiscardSeat: null,
     tenpaiSeat: null,
     guesserSeat: null,
     lockedWaits: [],
     pendingCall: null,
+    callPromptSettings: { [eastPlayerId]: true },
     guessHistory: [],
     selfDrawAttempts: [],
     rematchReadyPlayerIds: [],
@@ -131,6 +156,10 @@ export function joinGame(state: GameState, southPlayerId: string): GameState {
     ...state,
     phase: "draw_discard",
     southPlayerId,
+    callPromptSettings: {
+      ...(state.callPromptSettings ?? {}),
+      [southPlayerId]: true
+    },
     players: {
       ...state.players,
       south: south ?? {
@@ -160,7 +189,7 @@ export function startNextHandWithRotatedSeats(state: GameState, random = Math.ra
     throw new Error("Cannot start the next hand without two players.");
   }
 
-  const next = createInitialGame(state.roomCode, state.southPlayerId, random);
+  const next = createInitialGame(state.roomCode, state.southPlayerId, random, (state.handNumber ?? 1) + 1);
   return joinGame(next, state.eastPlayerId);
 }
 
@@ -249,6 +278,118 @@ export function takeDraw(state: GameState, seat: Seat): GameState {
   };
 }
 
+export function getConcealedKanOptions(state: GameState, seat: Seat): Tile[] {
+  if (state.phase !== "draw_discard" || state.currentTurn !== seat || state.pendingCall) {
+    return [];
+  }
+
+  const player = requirePlayer(state, seat);
+  const counts = new Map<Tile, number>();
+  for (const tile of [...player.hand, ...(player.drawnTile ? [player.drawnTile] : [])]) {
+    counts.set(tile, (counts.get(tile) ?? 0) + 1);
+  }
+
+  return [...counts.entries()].filter(([, count]) => count >= 4).map(([tile]) => tile);
+}
+
+export function takeConcealedKan(state: GameState, seat: Seat, tile: Tile): GameState {
+  assertPhase(state, "draw_discard");
+  assertTurn(state, seat);
+  if (state.pendingCall) {
+    throw new Error("Call decision is pending.");
+  }
+  if (!getConcealedKanOptions(state, seat).includes(tile)) {
+    throw new Error("No concealed kan is available for this tile.");
+  }
+
+  const player = requirePlayer(state, seat);
+  const removed = removeTilesFromPlayerConcealedKan(player, tile);
+  const meld: OpenMeld = {
+    type: "kan",
+    tiles: [tile, tile, tile, tile],
+    calledTileIndex: 1,
+    calledTile: tile,
+    fromSeat: seat,
+    concealed: true,
+    kanSubtype: "concealed"
+  };
+
+  return drawRinshanForKan(revealNextDoraIndicator({
+    ...state,
+    pendingDoraRevealAfterDiscardSeat: null,
+    players: {
+      ...state.players,
+      [seat]: {
+        ...player,
+        hand: sortHand(removed.hand),
+        drawnTile: removed.drawnTile,
+        melds: [...(player.melds ?? []), meld]
+      }
+    }
+  }), seat);
+}
+
+export function getAddedKanOptions(state: GameState, seat: Seat): Tile[] {
+  if (state.phase !== "draw_discard" || state.currentTurn !== seat || state.pendingCall) {
+    return [];
+  }
+
+  const player = requirePlayer(state, seat);
+  const handTiles = [...player.hand, ...(player.drawnTile ? [player.drawnTile] : [])];
+  return (player.melds ?? [])
+    .filter((meld) => meld.type === "pon" && meld.tiles.length === 3 && meld.tiles.every((tile) => tile === meld.tiles[0]))
+    .map((meld) => meld.tiles[0])
+    .filter((tile, index, tiles) => handTiles.includes(tile) && tiles.indexOf(tile) === index);
+}
+
+export function takeAddedKan(state: GameState, seat: Seat, tile: Tile): GameState {
+  assertPhase(state, "draw_discard");
+  assertTurn(state, seat);
+  if (state.pendingCall) {
+    throw new Error("Call decision is pending.");
+  }
+  if (!getAddedKanOptions(state, seat).includes(tile)) {
+    throw new Error("No added kan is available for this tile.");
+  }
+
+  const player = requirePlayer(state, seat);
+  const meldIndex = (player.melds ?? []).findIndex((meld) => meld.type === "pon" && meld.tiles.length === 3 && meld.tiles.every((meldTile) => meldTile === tile));
+  if (meldIndex === -1) {
+    throw new Error("No pon meld is available to upgrade.");
+  }
+
+  const removed = removeOneTileFromPlayer(player, tile);
+  const nextMelds = [...(player.melds ?? [])];
+  const ponMeld = nextMelds[meldIndex];
+  nextMelds[meldIndex] = {
+    ...ponMeld,
+    type: "kan",
+    tiles: [tile, tile, tile, tile],
+    calledTileIndex: Number.isInteger(ponMeld.calledTileIndex) ? ponMeld.calledTileIndex : 1,
+    calledTile: tile,
+    concealed: false,
+    kanSubtype: "added"
+  };
+
+  const nextState: GameState = {
+    ...state,
+    players: {
+      ...state.players,
+      [seat]: {
+        ...player,
+        hand: sortHand(removed.hand),
+        drawnTile: removed.drawnTile,
+        melds: nextMelds
+      }
+    }
+  };
+
+  return {
+    ...drawRinshanForKan(nextState, seat),
+    pendingDoraRevealAfterDiscardSeat: seat
+  };
+}
+
 export function takeDiscard(state: GameState, seat: Seat, tile: Tile, source: "hand" | "drawn" = "hand"): GameState {
   assertPhase(state, "draw_discard");
   assertTurn(state, seat);
@@ -261,19 +402,22 @@ export function takeDiscard(state: GameState, seat: Seat, tile: Tile, source: "h
   const nextState: GameState = {
     ...state,
     currentTurn: nextSeat,
+    pendingDoraRevealAfterDiscardSeat: state.pendingDoraRevealAfterDiscardSeat === seat ? null : state.pendingDoraRevealAfterDiscardSeat,
     players: {
       ...state.players,
       [seat]: { ...player, hand: discarded.hand, drawnTile: discarded.drawnTile, river: discarded.river }
     }
   };
+  const afterPendingDoraReveal = state.pendingDoraRevealAfterDiscardSeat === seat ? revealNextDoraIndicator(nextState) : nextState;
 
-  const tenpaiState = detectTenpaiAfterDiscard(nextState);
+  const tenpaiState = detectTenpaiAfterDiscard(afterPendingDoraReveal);
   if (tenpaiState.phase !== "draw_discard") {
     return tenpaiState;
   }
 
   const callOptions = getCallOptions(tile, requirePlayer(tenpaiState, nextSeat).hand);
-  if (callOptions.length > 0) {
+  const responder = requirePlayer(tenpaiState, nextSeat);
+  if (callOptions.length > 0 && isCallPromptEnabled(tenpaiState, responder.id)) {
     return {
       ...tenpaiState,
       pendingCall: {
@@ -286,6 +430,24 @@ export function takeDiscard(state: GameState, seat: Seat, tile: Tile, source: "h
   }
 
   return drawForTurnStart(tenpaiState, nextSeat);
+}
+
+export function isCallPromptEnabled(state: Pick<GameState, "callPromptSettings">, playerId: string): boolean {
+  return state.callPromptSettings?.[playerId] ?? true;
+}
+
+export function setCallPromptEnabled(state: GameState, playerId: string, enabled: boolean): GameState {
+  if (playerId !== state.eastPlayerId && playerId !== state.southPlayerId) {
+    throw new Error("Only seated players can update call prompt preference.");
+  }
+
+  return {
+    ...state,
+    callPromptSettings: {
+      ...(state.callPromptSettings ?? {}),
+      [playerId]: enabled
+    }
+  };
 }
 
 export function skipCall(state: GameState, seat: Seat): GameState {
@@ -365,7 +527,10 @@ function completeCall(state: GameState, seat: Seat, type: CallType, consumedTile
   };
 
   if (type === "kan") {
-    nextState = drawForTurnStart(nextState, seat);
+    nextState = {
+      ...drawRinshanForKan(nextState, seat),
+      pendingDoraRevealAfterDiscardSeat: seat
+    };
   }
 
   return nextState;
@@ -460,6 +625,35 @@ export function getGuessCandidateViewState(state: Pick<GameState, "guessHistory"
   };
 }
 
+export function getVisibleDoraIndicators(state: Pick<GameState, "doraIndicators" | "revealedDoraCount">): Tile[] {
+  return (state.doraIndicators ?? []).slice(0, Math.max(1, Math.min(5, state.revealedDoraCount ?? 1)));
+}
+
+export function getHiddenDoraIndicatorCount(state: Pick<GameState, "doraIndicators" | "revealedDoraCount">): number {
+  return Math.max(0, 5 - getVisibleDoraIndicators(state).length);
+}
+
+export function shouldAutoSkipCallPrompt(state: Pick<GameState, "pendingCall">, seat: Seat | null, callPromptsEnabled: boolean): boolean {
+  return Boolean(!callPromptsEnabled && seat && state.pendingCall?.responderSeat === seat);
+}
+
+export function getMeldTileViews(meld: OpenMeld): MeldTileView[] {
+  if (meld.type === "kan" && meld.concealed) {
+    return meld.tiles.map((tile, index) => ({
+      tile: index === 0 || index === meld.tiles.length - 1 ? null : tile,
+      hidden: index === 0 || index === meld.tiles.length - 1,
+      sideways: false
+    }));
+  }
+
+  const calledTileIndex = Number.isInteger(meld.calledTileIndex) ? meld.calledTileIndex : meld.type === "pon" || meld.type === "kan" ? 1 : Math.max(0, meld.tiles.indexOf(meld.calledTile));
+  return meld.tiles.map((tile, index) => ({
+    tile,
+    hidden: false,
+    sideways: index === calledTileIndex
+  }));
+}
+
 export function publicStateForSeat(state: GameState, viewerSeat: Seat | null): GameState {
   const hideHand = (player: PlayerState | null, seat: Seat) => {
     if (!player || seat === viewerSeat || state.phase === "game_over") {
@@ -540,8 +734,88 @@ function createOpenMeld(type: CallType, consumedTiles: Tile[], calledTile: Tile,
     tiles,
     calledTileIndex: type === "chi" ? tiles.indexOf(calledTile) : 1,
     calledTile,
-    fromSeat
+    fromSeat,
+    kanSubtype: type === "kan" ? "open" : undefined
   };
+}
+
+function reserveDeadWall(wall: Tile[]): { liveWall: Tile[]; deadWall: Tile[] } {
+  if (wall.length < 14) {
+    return { liveWall: wall, deadWall: [] };
+  }
+  return {
+    liveWall: wall.slice(0, -14),
+    deadWall: wall.slice(-14)
+  };
+}
+
+function revealNextDoraIndicator(state: GameState): GameState {
+  return {
+    ...state,
+    revealedDoraCount: Math.min(5, (state.revealedDoraCount ?? 1) + 1)
+  };
+}
+
+function drawRinshanForKan(state: GameState, seat: Seat): GameState {
+  if (!state.rinshanTiles) {
+    return drawForTurnStart(state, seat);
+  }
+  if (state.rinshanTiles.length === 0) {
+    return endExhaustiveDraw(state);
+  }
+
+  const player = requirePlayer(state, seat);
+  const [tile, ...remainingRinshanTiles] = state.rinshanTiles;
+  return {
+    ...state,
+    rinshanTiles: remainingRinshanTiles,
+    players: {
+      ...state.players,
+      [seat]: {
+        ...player,
+        hand: sortHand(player.drawnTile ? [...player.hand, player.drawnTile] : player.hand),
+        drawnTile: tile
+      }
+    }
+  };
+}
+
+function removeTilesFromPlayerConcealedKan(player: PlayerState, tile: Tile): { hand: Tile[]; drawnTile: Tile | null } {
+  let remainingToRemove = 4;
+  const nextHand = [...player.hand];
+  for (let index = nextHand.length - 1; index >= 0 && remainingToRemove > 0; index -= 1) {
+    if (nextHand[index] === tile) {
+      nextHand.splice(index, 1);
+      remainingToRemove -= 1;
+    }
+  }
+
+  let drawnTile = player.drawnTile ?? null;
+  if (remainingToRemove > 0 && drawnTile === tile) {
+    drawnTile = null;
+    remainingToRemove -= 1;
+  }
+
+  if (remainingToRemove !== 0) {
+    throw new Error("Concealed kan requires four matching tiles.");
+  }
+
+  return { hand: nextHand, drawnTile };
+}
+
+function removeOneTileFromPlayer(player: PlayerState, tile: Tile): { hand: Tile[]; drawnTile: Tile | null } {
+  const handIndex = player.hand.indexOf(tile);
+  if (handIndex !== -1) {
+    const hand = [...player.hand];
+    hand.splice(handIndex, 1);
+    return { hand, drawnTile: player.drawnTile ?? null };
+  }
+
+  if (player.drawnTile === tile) {
+    return { hand: player.hand, drawnTile: null };
+  }
+
+  throw new Error(`Cannot remove ${tile}; it is not in the hand.`);
 }
 
 export function getChiOptions(tile: Tile, hand: Tile[]): ChiOption[] {

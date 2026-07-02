@@ -94,12 +94,25 @@ export function TileButton({
   );
 }
 
-export function TileBack() {
+export function TileBack({ size = "md" }: { size?: "md" | "info" } = {}) {
+  const sizes = {
+    md: {
+      tile: "h-[72px] w-[50px] sm:h-20 sm:w-14",
+      artwork: "h-[62px] w-[44px] sm:h-[68px] sm:w-[48px]",
+      glyph: "text-[58px] sm:text-[66px]"
+    },
+    info: {
+      tile: "h-[48px] w-[34px] sm:h-[52px] sm:w-[37px]",
+      artwork: "h-[42px] w-[30px] sm:h-[46px] sm:w-[33px]",
+      glyph: "text-[38px] sm:text-[42px]"
+    }
+  }[size];
+
   return (
-    <div className="relative flex h-[72px] w-[50px] shrink-0 items-center justify-center overflow-hidden rounded-md border border-emerald-950 bg-white shadow-[0_5px_0_rgba(20,83,45,0.45),0_10px_18px_rgba(23,33,28,0.16)] sm:h-20 sm:w-14">
+    <div className={clsx("relative flex shrink-0 items-center justify-center overflow-hidden rounded-md border border-emerald-950 bg-white shadow-[0_5px_0_rgba(20,83,45,0.45),0_10px_18px_rgba(23,33,28,0.16)]", sizes.tile)}>
       <span className="absolute inset-0 grid place-items-center">
-        <span className="grid h-[62px] w-[44px] place-items-center overflow-visible sm:h-[68px] sm:w-[48px]">
-          <span className="block -translate-y-px text-center text-[58px] leading-none sm:text-[66px]">🀫</span>
+        <span className={clsx("grid place-items-center overflow-visible", sizes.artwork)}>
+          <span className={clsx("block -translate-y-px text-center leading-none", sizes.glyph)}>🀫</span>
         </span>
       </span>
     </div>

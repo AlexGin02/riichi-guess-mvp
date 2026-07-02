@@ -8,16 +8,25 @@ import {
   OpenMeld,
   RiverTile,
   forceKnownTenpaiSetup,
+  getAddedKanOptions,
+  getConcealedKanOptions,
   getGuessCandidateViewState,
+  getHiddenDoraIndicatorCount,
+  getMeldTileViews,
   getPreviouslyGuessedTiles,
+  getVisibleDoraIndicators,
+  isCallPromptEnabled,
   riverTileSource,
   riverTileValue,
   requestNextHand,
   resolveGuess,
   resolveSelfDrawTrial,
+  setCallPromptEnabled,
   skipCall,
   takeCall,
+  takeAddedKan,
   takeChiOption,
+  takeConcealedKan,
   takeDiscard
 } from "@/lib/game";
 import { TILE_TYPES, Tile } from "@/lib/mahjong";
@@ -54,6 +63,9 @@ export default function Home() {
   const player = seat ? state?.players[seat] : null;
   const isMyTurn = Boolean(state && seat && state.currentTurn === seat && state.phase === "draw_discard" && !state.pendingCall);
   const pendingCallForMe = Boolean(state?.pendingCall && seat === state.pendingCall.responderSeat);
+  const concealedKanOptions = state && seat ? getConcealedKanOptions(state, seat) : [];
+  const addedKanOptions = state && seat ? getAddedKanOptions(state, seat) : [];
+  const callPromptsEnabled = state && playerId ? isCallPromptEnabled(state, playerId) : true;
   const seatLabel = seat === "east" ? "你是东家" : seat === "south" ? "你是南家" : "你是观战者";
   const turnLabel = state?.phase === "draw_discard" && seat ? (isMyTurn ? "你的回合" : "等待对手") : "";
   const shareUrl =
@@ -165,6 +177,26 @@ export default function Home() {
             <StatusPill label="牌山剩余" value={state.wall.length > 0 ? `${state.wall.length}` : "已耗尽"} tone={state.wall.length > 0 ? "stone" : "ember"} />
             <StatusPill label="座位" value={seatLabel} tone="stone" />
             {turnLabel && <StatusPill label="回合" value={turnLabel} tone={isMyTurn ? "ember" : "stone"} />}
+            {seat && (
+              <button
+                type="button"
+                aria-pressed={callPromptsEnabled}
+                disabled={isBusy || !playerId}
+                onClick={() =>
+                  void runAction(async () => {
+                    if (!playerId) {
+                      throw new Error("只有本房间玩家可以设置鸣牌提示。");
+                    }
+                    await writeState(setCallPromptEnabled(state, playerId, !callPromptsEnabled));
+                  })
+                }
+                className={`rounded-md border px-3 py-2 font-bold shadow-sm transition ${
+                  callPromptsEnabled ? "border-felt bg-jade text-felt" : "border-stone-300 bg-paper text-stone-500"
+                }`}
+              >
+                鸣牌提示：{callPromptsEnabled ? "开" : "关"}
+              </button>
+            )}
           </div>
         )}
       </header>
@@ -239,6 +271,7 @@ export default function Home() {
             </div>
 
             <aside className="space-y-4">
+              <DoraIndicatorsPanel state={state} />
               <PhasePanel
                 state={state}
                 seat={seat}
@@ -316,6 +349,32 @@ export default function Home() {
                     <p className="text-sm font-bold text-stone-600">{turnLabel || PHASE_LABELS[state.phase]}</p>
                   </div>
                   <div className="flex items-center gap-2">
+                    <KanOptionGroup
+                      label="暗杠？"
+                      tiles={concealedKanOptions}
+                      disabled={isBusy}
+                      onSelect={(tile) =>
+                        void runAction(async () => {
+                          if (!seat) {
+                            throw new Error("只有本房间玩家可以暗杠。");
+                          }
+                          await writeState(takeConcealedKan(state, seat, tile));
+                        })
+                      }
+                    />
+                    <KanOptionGroup
+                      label="加杠？"
+                      tiles={addedKanOptions}
+                      disabled={isBusy}
+                      onSelect={(tile) =>
+                        void runAction(async () => {
+                          if (!seat) {
+                            throw new Error("只有本房间玩家可以加杠。");
+                          }
+                          await writeState(takeAddedKan(state, seat, tile));
+                        })
+                      }
+                    />
                     <span className="rounded-md bg-paper px-3 py-2 text-sm font-black text-stone-700">牌山剩余：{state.wall.length > 0 ? state.wall.length : "已耗尽"}</span>
                   </div>
                 </div>
@@ -380,6 +439,29 @@ function StatusPill({ label, value, tone }: { label: string; value: string; tone
   );
 }
 
+function KanOptionGroup({ label, tiles, disabled, onSelect }: { label: string; tiles: Tile[]; disabled: boolean; onSelect: (tile: Tile) => void }) {
+  if (tiles.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 rounded-md bg-paper px-2 py-2">
+      <span className="text-sm font-black text-stone-700">{label}</span>
+      {tiles.map((tile) => (
+        <button
+          key={tile}
+          type="button"
+          disabled={disabled}
+          onClick={() => onSelect(tile)}
+          className="rounded-md border border-stone-300 bg-white p-1 shadow-sm transition hover:border-felt hover:bg-jade disabled:opacity-50"
+        >
+          <TileButton tile={tile} size="info" disabled interactive={false} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function SeatStatus({ label, active, current, mine }: { label: string; active: boolean; current: boolean; mine: boolean }) {
   return (
     <div className={`rounded-md border p-3 ${current ? "border-ember bg-amber-50" : "border-stone-200 bg-paper"}`}>
@@ -409,6 +491,41 @@ function River({ title, seat, tiles, current }: { title: string; seat: "east" | 
         })}
       </div>
     </section>
+  );
+}
+
+function DoraIndicatorsPanel({ state }: { state: GameState }) {
+  const visibleIndicators = getVisibleDoraIndicators(state);
+  const hiddenCount = getHiddenDoraIndicatorCount(state);
+
+  return (
+    <section className="rounded-md border border-stone-300 bg-white p-4 shadow-sm">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="text-lg font-black text-ink">宝牌指示牌</h2>
+        <span className="rounded-md bg-paper px-2 py-1 text-xs font-black text-stone-600">{visibleIndicators.length}/5</span>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {visibleIndicators.map((tile, index) => (
+          <TileButton key={`${tile}-${index}`} tile={tile} size="info" disabled interactive={false} />
+        ))}
+        {Array.from({ length: hiddenCount }).map((_, index) => (
+          <HiddenDoraSlot key={`hidden-dora-${index}`} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function HiddenDoraSlot({ size = "info" }: { size?: "info" | "river" } = {}) {
+  const sizeClass = {
+    info: "h-[48px] w-[34px] sm:h-[52px] sm:w-[37px]",
+    river: "h-[58px] w-[40px] sm:h-[62px] sm:w-[43px]"
+  }[size];
+  return (
+    <div
+      aria-label="隐藏宝牌指示牌"
+      className={`${sizeClass} shrink-0 rounded-md border border-stone-300 bg-stone-100 shadow-[0_4px_0_rgba(120,113,108,0.22),0_8px_14px_rgba(23,33,28,0.08)] ring-1 ring-white/80`}
+    />
   );
 }
 
@@ -658,8 +775,7 @@ function MeldRow({ title, melds }: { title: string; melds: NonNullable<GameState
 }
 
 function OpenMeldTiles({ meld }: { meld: OpenMeld }) {
-  const calledTileIndex = getCalledTileIndex(meld);
-  return <SidewaysTileGroup tiles={meld.tiles} calledTileIndex={calledTileIndex} />;
+  return <MeldTileGroup meld={meld} />;
 }
 
 function ChiOptionTiles({ tiles, calledTileIndex }: { tiles: Tile[]; calledTileIndex: number }) {
@@ -683,14 +799,31 @@ function SidewaysTileGroup({ tiles, calledTileIndex }: { tiles: Tile[]; calledTi
   );
 }
 
-function getCalledTileIndex(meld: OpenMeld): number {
-  if (Number.isInteger(meld.calledTileIndex)) {
-    return meld.calledTileIndex;
-  }
-  if (meld.type === "pon" || meld.type === "kan") {
-    return 1;
-  }
-  return Math.max(0, meld.tiles.indexOf(meld.calledTile));
+function MeldTileGroup({ meld }: { meld: OpenMeld }) {
+  return (
+    <div className="flex min-h-[62px] items-center gap-1.5">
+      {getMeldTileViews(meld).map((view, tileIndex) => {
+        if (view.hidden) {
+          return (
+            <div key={`hidden-${tileIndex}`} className="grid h-[62px] w-[43px] place-items-center">
+              <HiddenDoraSlot size="river" />
+            </div>
+          );
+        }
+        if (!view.tile) {
+          return null;
+        }
+
+        return (
+          <div key={`${view.tile}-${tileIndex}`} className={view.sideways ? "grid h-[44px] w-[62px] place-items-center" : "grid h-[62px] w-[43px] place-items-center"}>
+            <div className={view.sideways ? "rotate-90" : undefined}>
+              <TileButton tile={view.tile} size="river" disabled interactive={false} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function callLabel(type: CallType): string {
